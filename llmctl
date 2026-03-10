@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+# llmctl - LLM Model Controller
+# Manages llama.cpp systemd services for local LLM inference
+# Usage: llmctl [command] [model] [options]
+# 
+# CRITICAL: Only ONE model can run at a time on RTX 3090 (24GB VRAM)
+# This tool enforces mutual exclusivity - starting one model stops all others
+
+set -euo pipefail
+
+# Configuration
+SERVICE_DIR="$HOME/.config/systemd/user"
+LOG_DIR="$HOME/.local/log"
+BIN_DIR="/home/nervkil/apps/llama.cpp/build/bin"
+HOME_DIR="/home/nervkil"
+APPS_DIR="/home/nervkil/apps"
+MODELS_DIR="/mnt/llm"  # Base directory for all LLM models
+TEMPLATES_DIR="/home/nervkil/apps/templates"  # Chat template files
+
+# Create log directory if it doesn't exist
+mkdir -p "$LOG_DIR"
+mkdir -p "$SERVICE_DIR"
+
+# Model configuration
+# NOTE: Only ONE model can run at a time - enforced by start_model()
+declare -A MODELS=(
+    ["glm"]="llm-glm.service"
+    ["qwen"]="llm-qwen.service"
+    ["glm-opus"]="llm-glm-opus.service"
+)
+
+declare -A MODEL_PORTS=(
+    ["glm"]="8003"
+    ["qwen"]="8001"
+    ["glm-opus"]="8004"
+)
+
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Helper functions
+show_usage() {
+    echo "Usage: llmctl [COMMAND] [MODEL] [OPTIONS]"
+    echo ""
+    echo "Commands:"
+    echo "  start <model>      Start a model server (stops all others first)"
+    echo "  stop <model>       Stop a model server"
+    echo "  stop-all           Stop ALL model servers"
+    echo "  restart <model>    Restart a model server"
+    echo "  status [model]     Show status of service(s)"
+    echo "  list               List all configured models"
+    echo "  ps                 Show running llama-server processes"
+    echo "  logs [model]       Show logs (use -f to follow)"
+    echo "  setup              Create/update systemd services"
+    echo "  enable <model>     Enable at boot"
+    echo "  disable <model>    Disable at boot"
+    echo "  reload             Reload systemd daemon"
+    echo "  switch <model>     Stop current, start new model"
+    echo ""
+    echo "Models:"
+    echo "  glm        - GLM-4.7-Flash (port 8003, 200K context, tool calling)"
+    echo "  qwen       - Qwen3.5-397B (port 8001, 256K context, tool calling)"
+    echo "  glm-opus   - GLM-4.7-Flash-Claude-Opus-4.5 (port 8004, 200K context, tool calling)"
+    echo ""
+    echo "IMPORTANT: Only ONE model can run at a time on RTX 3090!"
+    echo "   Starting a model automatically stops all others."
+    echo ""
+    echo "Examples:"
+    echo "  llmctl start glm          # Start GLM (stops Qwen if running)"
+    echo "  llmctl switch qwen        # Stop current, start Qwen"
+    echo "  llmctl status              # Show all services"
+    echo "  llmctl logs glm -f         # Follow GLM logs"
+    echo "  llmctl stop-all            # Emergency stop all models"
+}
+
+check_systemd() {
+    if ! command -v systemctl &> /dev/null; then
+        echo -e "${RED}Error: systemctl not found${NC}"
+        exit 1
+    fi
+}
+
+check_root() {
+    if [[ $EUID -eq 0 ]]; then
+        echo -e "${RED}Error: Do not run as root${NC}"
+        exit 1
+    fi
+}
+
+# CRITICAL: Stop all other models before starting a new one
+# This prevents OOM (Out of Memory) crashes
+stop_all_others() {
+    local model_to_keep="${1:-}"
+    
+    echo -e "${BLUE}Checking for other running models...${NC}"
+    
+    for model_key in "${!MODELS[@]}"; do
+        if [[ "$model_key" != "$model_to_keep" ]]; then
+            local service="${MODELS[$model_key]}"
+            if systemctl --user is-active --quiet "$service" 2>/dev/null; then
+                echo -e "${YELLOW}Stopping $model_key to free VRAM...${NC}"
+                systemctl --user stop "$service" 2>/dev/null || true
+                sleep 2
+            fi
+        fi
+    done
+    
+    # Double-check with pkill as fallback
+    local port_to_keep=""
+    if [[ -n "$model_to_keep" ]]; then
+        port_to_keep="${MODEL_PORTS[$model_to_keep]}"
+    fi
+    
+    # Kill any llama-server processes except the one we're about to start
+    for pid in $(pgrep -f "llama-server" 2>/dev/null || true); do
+        if [[ -n "$pid" ]]; then
+            local cmdline=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' || true)
+            if [[ -n "$port_to_keep" && ! "$cmdline" =~ "port $port_to_keep" ]]; then
+                echo -e "${YELLOW}Killing orphaned llama-server process $pid${NC}"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
+    
+    sleep 2
+    
+    # Verify VRAM is freed
+    local vram_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo "0")
+    echo -e "${GREEN}VRAM freed: ${vram_free} MiB available${NC}"
+}
+
+# Create proper service file for a model using cat with proper parameters
+create_glm_service() {
+    local service_file="${SERVICE_DIR}/llm-glm.service"
+    
+    echo -e "${BLUE}Creating GLM service file...${NC}"
+    
+    if [[ -f "$service_file" ]]; then
+        echo -e "${YELLOW}Backing up existing GLM service...${NC}"
+        mv "$service_file" "${service_file}.bak.$(date +%Y%m%d-%H%M%S)"
+    fi
+    
+    cat > "$service_file" << 'GLMEOF'
+[Unit]
+Description=LLM GLM-4.7-Flash Server (200K Context with Tool Calling)
+After=network.target nvidia-persistenced.service
+
+[Service]
+Environment="LD_LIBRARY_PATH=/run/opengl-driver/lib:/home/nervkil/apps/llama.cpp/build/bin"
+Environment="HOME=/home/nervkil"
+WorkingDirectory=/home/nervkil/apps
+ExecStart=/home/nervkil/apps/llama.cpp/build/bin/llama-server \
+    --model "/mnt/llm/glm-4.7-flash/model/GLM-4.7-Flash-UD-Q4_K_XL.gguf" \
+    --alias "GLM-4.7-Flash-200K" \
+    --port 8003 \
+    --host 0.0.0.0 \
+    --ctx-size 200704 \
+    -ngl 999 \
+    --flash-attn on \
+    --threads 16 \
+    -b 2048 \
+    -ub 2048 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
+    --jinja \
+    --chat-template-file "/home/nervkil/apps/templates/glm-4.7-flash-chat-template.jinja" \
+    --temp 0.7 \
+    --top-p 1.0 \
+    --min-p 0.01 \
+    --repeat-penalty 1.0
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/nervkil/.local/log/llm-glm.log
+StandardError=append:/home/nervkil/.local/log/llm-glm.log
+
+[Install]
+WantedBy=default.target
+GLMEOF
+    
+    echo -e "${GREEN}GLM service file created: ${service_file}${NC}"
+}
+
+create_qwen_service() {
+    local service_file="${SERVICE_DIR}/llm-qwen.service"
+    
+    echo -e "${BLUE}Creating Qwen service file...${NC}"
+    
+    if [[ -f "$service_file" ]]; then
+        echo -e "${YELLOW}Backing up existing Qwen service...${NC}"
+        mv "$service_file" "${service_file}.bak.$(date +%Y%m%d-%H%M%S)"
+    fi
+    
+    cat > "$service_file" << 'QWENEOF'
+[Unit]
+Description=LLM Qwen3.5-397B Server (256K Context with Tool Calling)
+After=network.target nvidia-persistenced.service
+
+[Service]
+Environment="LD_LIBRARY_PATH=/run/opengl-driver/lib:/home/nervkil/apps/llama.cpp/build/bin"
+Environment="HOME=/home/nervkil"
+WorkingDirectory=/home/nervkil/apps
+ExecStart=/home/nervkil/apps/llama.cpp/build/bin/llama-server \
+    --model "/mnt/llm/qwen3.5-397b/model/UD-Q4_K_XL/Qwen3.5-397B-A17B-UD-Q4_K_XL-00001-of-00006.gguf" \
+    --alias "unsloth/Qwen3.5-397B-A17B" \
+    --port 8001 \
+    --host 0.0.0.0 \
+    --ctx-size 262144 \
+    -ngl 999 \
+    --cpu-moe \
+    --flash-attn on \
+    --threads 16 \
+    -b 2048 \
+    -ub 2048 \
+    -ctk q4_0 \
+    -ctv q4_0 \
+    --jinja \
+    --chat-template-file "/home/nervkil/apps/templates/qwen3.5-chat-template_2.jinja" \
+    --temp 0.6 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --min-p 0.00
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/nervkil/.local/log/llm-qwen.log
+StandardError=append:/home/nervkil/.local/log/llm-qwen.log
+
+[Install]
+WantedBy=default.target
+QWENEOF
+    
+    echo -e "${GREEN}Qwen service file created: ${service_file}${NC}"
+}
+
+create_glm_opus_service() {
+    local service_file="${SERVICE_DIR}/llm-glm-opus.service"
+    
+    echo -e "${BLUE}Creating GLM-Opus service file...${NC}"
+    
+    if [[ -f "$service_file" ]]; then
+        echo -e "${YELLOW}Backing up existing GLM-Opus service...${NC}"
+        mv "$service_file" "${service_file}.bak.$(date +%Y%m%d-%H%M%S)"
+    fi
+    
+    cat > "$service_file" << 'GLMOPUSEOF'
+[Unit]
+Description=LLM GLM-4.7-Flash-Claude-Opus-4.5 Server (200K Context with Tool Calling)
+After=network.target nvidia-persistenced.service
+
+[Service]
+Environment="LD_LIBRARY_PATH=/run/opengl-driver/lib:/home/nervkil/apps/llama.cpp/build/bin"
+Environment="HOME=/home/nervkil"
+WorkingDirectory=/home/nervkil/apps
+ExecStart=/home/nervkil/apps/llama.cpp/build/bin/llama-server \
+    --model "/mnt/llm/glm-4.7-flash-claude-4.5-opus/model/glm-4.7-flash-claude-4.5-opus.q4_k_m.gguf" \
+    --alias "GLM-4.7-Flash-Claude-Opus-4.5-200K" \
+    --port 8004 \
+    --host 0.0.0.0 \
+    --ctx-size 200704 \
+    -ngl 999 \
+    --flash-attn on \
+    --threads 16 \
+    -b 2048 \
+    -ub 2048 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
+    --jinja \
+    --chat-template-file "/home/nervkil/apps/templates/glm-4.7-flash-chat-template.jinja" \
+    --temp 0.7 \
+    --top-p 1.0 \
+    --min-p 0.01 \
+    --repeat-penalty 1.0
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/nervkil/.local/log/llm-glm-opus.log
+StandardError=append:/home/nervkil/.local/log/llm-glm-opus.log
+
+[Install]
+WantedBy=default.target
+GLMOPUSEOF
+    
+    echo -e "${GREEN}GLM-Opus service file created: ${service_file}${NC}"
+}
+
+setup_services() {
+    check_systemd
+    check_root
+    
+    echo -e "${BLUE}=== LLM Controller - Service Setup ===${NC}"
+    echo ""
+    echo -e "${YELLOW}WARNING: This will overwrite existing service files${NC}"
+    echo -e "${YELLOW}with corrected versions including all required parameters${NC}"
+    echo ""
+    
+    create_glm_service
+    create_qwen_service
+    create_glm_opus_service
+    
+    echo ""
+    echo -e "${BLUE}Reloading systemd daemon...${NC}"
+    systemctl --user daemon-reload
+    
+    echo ""
+    echo -e "${GREEN}=== Setup Complete ===${NC}"
+    echo "Services updated for: glm, qwen, glm-opus"
+    echo ""
+    echo "To start a model (only one at a time!):"
+    echo "  llmctl start glm        # Start GLM-4.7-Flash"
+    echo "  llmctl start qwen       # Start Qwen3.5-397B"
+    echo "  llmctl start glm-opus   # Start GLM-4.7-Flash-Claude-Opus-4.5"
+    echo ""
+    echo "To switch between models:"
+    echo "  llmctl switch qwen      # Automatically stops current, starts Qwen"
+    echo "  llmctl switch glm-opus  # Automatically stops current, starts GLM-Opus"
+}
+
+start_model() {
+    local model=$1
+    local service="${MODELS[$model]}"
+    local port="${MODEL_PORTS[$model]}"
+    
+    if [[ -z "$service" ]]; then
+        echo -e "${RED}Error: Unknown model '${model}'${NC}"
+        echo ""
+        echo "Available models:"
+        for key in "${!MODELS[@]}"; do
+            echo "  $key"
+        done
+        exit 1
+    fi
+    
+    # CRITICAL: Stop all other models first to prevent OOM
+    stop_all_others "$model"
+    
+    # CRITICAL: Manage systemd enable/disable state to ensure only one model
+    # persists after reboot. Disable all other models from systemd auto-start,
+    # then enable only the model we're starting.
+    echo -e "${BLUE}Updating systemd auto-start configuration...${NC}"
+    for other_model in "${!MODELS[@]}"; do
+        if [[ "$other_model" != "$model" ]]; then
+            local other_service="${MODELS[$other_model]}"
+            # Suppress error if already disabled or service doesn't exist
+            systemctl --user disable "$other_service" 2>/dev/null || true
+        fi
+    done
+    
+    # Enable only this model for auto-start (suppress error if already enabled)
+    systemctl --user enable "$service" 2>/dev/null || true
+    
+    echo -e "${GREEN}Starting ${model} service on port ${port}...${NC}"
+    systemctl --user start "$service"
+    
+    sleep 3
+    
+    if systemctl --user is-active --quiet "$service"; then
+        echo -e "${GREEN}✓ ${model} is now running on port ${port}${NC}"
+        systemctl --user --no-pager status "$service" | head -8
+    else
+        echo -e "${RED}✗ Failed to start ${model}${NC}"
+        echo "Check logs: llmctl logs ${model}"
+        exit 1
+    fi
+}
+
+stop_model() {
+    local model=$1
+    local service="${MODELS[$model]}"
+    
+    if [[ -z "$service" ]]; then
+        echo -e "${RED}Error: Unknown model '${model}'${NC}"
+        exit 1
+    fi
+    
+    systemctl --user stop "$service" 2>/dev/null || true
+    
+    # Also kill by port as fallback
+    local port="${MODEL_PORTS[$model]}"
+    lsof -ti:"$port" | xargs kill -9 2>/dev/null || true
+    
+    echo -e "${GREEN}Stopped ${model} service${NC}"
+}
+
+stop_all_models() {
+    echo -e "${YELLOW}Stopping ALL LLM services...${NC}"
+    
+    for model in "${!MODELS[@]}"; do
+        local service="${MODELS[$model]}"
+        if systemctl --user is-active --quiet "$service" 2>/dev/null; then
+            echo -e "${YELLOW}Stopping ${model}...${NC}"
+            systemctl --user stop "$service" 2>/dev/null || true
+        fi
+    done
+    
+    # Nuclear option: kill all llama-server processes
+    pkill -9 -f "llama-server" 2>/dev/null || true
+    
+    sleep 2
+    echo -e "${GREEN}All LLM services stopped${NC}"
+    
+    # Show freed VRAM
+    local vram_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo "0")
+    echo -e "${GREEN}VRAM freed: ${vram_free} MiB available${NC}"
+}
+
+restart_model() {
+    local model=$1
+    local service="${MODELS[$model]}"
+    
+    if [[ -z "$service" ]]; then
+        echo -e "${RED}Error: Unknown model '${model}'${NC}"
+        exit 1
+    fi
+    
+    # Also stop others to be safe
+    stop_all_others "$model"
+    
+    systemctl --user restart "$service"
+    echo -e "${GREEN}Restarted ${model} service${NC}"
+    sleep 3
+    systemctl --user --no-pager status "$service" | head -10
+}
+
+switch_model() {
+    local model=$1
+    
+    if [[ -z "$model" ]]; then
+        echo -e "${RED}Error: No model specified${NC}"
+        show_usage
+        exit 1
+    fi
+    
+    echo -e "${BLUE}Switching to ${model}...${NC}"
+    stop_all_others "$model"
+    start_model "$model"
+}
+
+show_status() {
+    local model=${1:-}
+    
+    if [[ -z "$model" ]]; then
+        echo -e "${BLUE}=== All LLM Services ===${NC}"
+        systemctl --user list-units --no-pager | grep -E "llm-|UNIT" | head -20
+        echo ""
+        echo -e "${BLUE}=== GPU Status ===${NC}"
+        nvidia-smi | grep -E "(GPU|llama|MiB|Processes)" -A8
+    else
+        local service="${MODELS[$model]}"
+        if [[ -n "$service" ]]; then
+            systemctl --user --no-pager status "$service"
+        else
+            echo -e "${RED}Unknown model: ${model}${NC}"
+            exit 1
+        fi
+    fi
+}
+
+show_list() {
+    echo -e "${BLUE}Available Models (ONLY ONE can run at a time):${NC}"
+    echo ""
+    echo -e "  ${GREEN}glm${NC}      - GLM-4.7-Flash"
+    echo "             Port: 8003"
+    echo "             Context: 200,704 tokens (200K)"
+    echo "             Features: Tool calling, Full GPU offload"
+    echo ""
+    echo -e "  ${GREEN}qwen${NC}     - Qwen3.5-397B-A17B"
+    echo "             Port: 8001"
+    echo "             Context: 262,144 tokens (256K)"
+    echo "             Features: Tool calling, MoE, CPU offloading for experts"
+    echo ""
+    echo -e "  ${GREEN}glm-opus${NC} - GLM-4.7-Flash-Claude-Opus-4.5 (Claude-4.5 Opus Distill)"
+    echo "             Port: 8004"
+    echo "             Context: 200,704 tokens (200K)"
+    echo "             Features: Tool calling, Full GPU offload, Claude-4.5 Opus reasoning"
+    echo ""
+    echo -e "${YELLOW}NOTE: RTX 3090 has 24GB VRAM - only ONE model fits at a time${NC}"
+    echo -e "${YELLOW}   Use 'llmctl switch <model>' to change models${NC}"
+}
+
+show_ps() {
+    echo -e "${BLUE}Running llama-server processes:${NC}"
+    ps aux | grep "llama-server" | grep -v grep || echo "No llama-server processes running"
+}
+
+show_logs() {
+    local model=${1:-}
+    local follow=false
+    
+    # Check for -f flag
+    for arg in "$@"; do
+        if [[ "$arg" == "-f" ]]; then
+            follow=true
+        fi
+    done
+    
+    if [[ -z "$model" || "$model" == "-f" ]]; then
+        echo -e "${BLUE}Recent logs from all models:${NC}"
+        echo ""
+        for logfile in "${LOG_DIR}"/llm-*.log; do
+            if [[ -f "$logfile" ]]; then
+                local name=$(basename "$logfile" .log)
+                echo -e "${YELLOW}=== ${name} (last 20 lines) ===${NC}"
+                tail -n 20 "$logfile" 2>/dev/null || echo "Unable to read log"
+                echo ""
+            fi
+        done
+    else
+        local log_file="${LOG_DIR}/llm-${model}.log"
+        if [[ -f "$log_file" ]]; then
+            if [[ "$follow" == true ]]; then
+                echo -e "${BLUE}Following logs for ${model} (Ctrl+C to exit):${NC}"
+                tail -f "$log_file"
+            else
+                echo -e "${BLUE}Last 50 lines of ${model} logs:${NC}"
+                tail -n 50 "$log_file"
+            fi
+        else
+            echo -e "${RED}Log file not found: ${log_file}${NC}"
+        fi
+    fi
+}
+
+enable_model() {
+    local model=$1
+    local service="${MODELS[$model]}"
+    
+    if [[ -z "$service" ]]; then
+        echo -e "${RED}Error: Unknown model '${model}'${NC}"
+        exit 1
+    fi
+    
+    systemctl --user enable "$service"
+    echo -e "${GREEN}Enabled ${model} to start at boot${NC}"
+}
+
+disable_model() {
+    local model=$1
+    local service="${MODELS[$model]}"
+    
+    if [[ -z "$service" ]]; then
+        echo -e "${RED}Error: Unknown model '${model}'${NC}"
+        exit 1
+    fi
+    
+    systemctl --user disable "$service"
+    echo -e "${GREEN}Disabled ${model} from starting at boot${NC}"
+}
+
+reload_systemd() {
+    check_systemd
+    systemctl --user daemon-reload
+    echo -e "${GREEN}Systemd daemon reloaded${NC}"
+}
+
+# Main execution
+main() {
+    if [[ $# -eq 0 ]]; then
+        show_usage
+        exit 1
+    fi
+    
+    local command="$1"
+    shift
+    local model=""
+    local extra_args=()
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f)
+                extra_args+=("-f")
+                ;;
+            *)
+                if [[ -z "$model" ]]; then
+                    model="$1"
+                else
+                    extra_args+=("$1")
+                fi
+                ;;
+        esac
+        shift
+    done
+    
+    case "$command" in
+        start)
+            if [[ -z "$model" ]]; then
+                echo -e "${RED}Error: No model specified${NC}"
+                show_usage
+                exit 1
+            fi
+            start_model "$model"
+            ;;
+        stop)
+            if [[ -z "$model" ]]; then
+                echo -e "${RED}Error: No model specified${NC}"
+                show_usage
+                exit 1
+            fi
+            stop_model "$model"
+            ;;
+        stop-all)
+            stop_all_models
+            ;;
+        restart)
+            if [[ -z "$model" ]]; then
+                echo -e "${RED}Error: No model specified${NC}"
+                show_usage
+                exit 1
+            fi
+            restart_model "$model"
+            ;;
+        switch)
+            if [[ -z "$model" ]]; then
+                echo -e "${RED}Error: No model specified${NC}"
+                show_usage
+                exit 1
+            fi
+            switch_model "$model"
+            ;;
+        status)
+            show_status "$model"
+            ;;
+        list)
+            show_list
+            ;;
+        ps)
+            show_ps
+            ;;
+        logs)
+            show_logs "$model" "${extra_args[@]}"
+            ;;
+        setup)
+            setup_services
+            ;;
+        enable)
+            if [[ -z "$model" ]]; then
+                echo -e "${RED}Error: No model specified${NC}"
+                show_usage
+                exit 1
+            fi
+            enable_model "$model"
+            ;;
+        disable)
+            if [[ -z "$model" ]]; then
+                echo -e "${RED}Error: No model specified${NC}"
+                show_usage
+                exit 1
+            fi
+            disable_model "$model"
+            ;;
+        reload)
+            reload_systemd
+            ;;
+        help|--help|-h)
+            show_usage
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown command '${command}'${NC}"
+            echo ""
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
