@@ -4,20 +4,20 @@ A CLI tool for managing llama.cpp model servers with systemd integration.
 
 ## Overview
 
-`llmctl` manages local LLM inference using llama.cpp, designed for systems with VRAM constraints (like an RTX 3090 with 24GB VRAM). Only **one model can run at a time**, and the tool ensures the last running model persists after reboot.
+`llmctl` manages local LLM inference using llama.cpp. Only **one model can run at a time**, and the tool ensures the last running model persists after reboot.
 
 ## Features
 
 - **Mutual Exclusivity**: Automatically stops other models before starting a new one
 - **Persistence**: The last started model is enabled to auto-start after reboot
 - **Systemd Integration**: Full systemd service management
-- **VRAM Protection**: Prevents out-of-memory crashes on GPU
+- **VRAM Protection**: Prevents out-of-memory crashes on GPU by enforcing single-model policy
 - **OpenAI-Compatible API**: Models expose REST APIs on configurable ports
 
 ## Requirements
 
 - Linux system with systemd
-- NVIDIA GPU (tested on RTX 3090)
+- NVIDIA GPU (for GPU acceleration)
 - llama.cpp compiled and available
 - Models stored in GGUF format
 
@@ -134,11 +134,10 @@ Each model requires a `create_*_service()` function that generates the systemd s
 ## Important Notes
 
 ### VRAM Constraints
-- RTX 3090 has 24GB VRAM
-- Only ONE model can run simultaneously
-- Larger models may require KV cache quantization (`--cache-type-k q4_0`)
-
-### Auto-Start Behavior
+- Only ONE model can run simultaneously (enforced by `llmctl`)
+- Starting a new model automatically stops all others
+- Larger models may require KV cache quantization (`--cache-type-k q4_0`) to fit in available VRAM
+- Monitor VRAM usage with `nvidia-smi` or similar tools
 - When you run `llmctl start <model>`, that model is enabled for auto-start
 - All other models are disabled from auto-start
 - On reboot, only the last started model will automatically start
