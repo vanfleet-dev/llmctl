@@ -27,12 +27,14 @@ declare -A MODELS=(
     ["glm"]="llm-glm.service"
     ["qwen"]="llm-qwen.service"
     ["glm-opus"]="llm-glm-opus.service"
+    ["qwen3.5-27b-opus"]="llm-qwen3.5-27b-opus.service"
 )
 
 declare -A MODEL_PORTS=(
     ["glm"]="8003"
     ["qwen"]="8001"
     ["glm-opus"]="8004"
+    ["qwen3.5-27b-opus"]="8005"
 )
 
 # Color codes
@@ -62,9 +64,10 @@ show_usage() {
     echo "  switch <model>     Stop current, start new model"
     echo ""
     echo "Models:"
-    echo "  glm        - GLM-4.7-Flash (port 8003, 200K context, tool calling)"
-    echo "  qwen       - Qwen3.5-397B (port 8001, 256K context, tool calling)"
-    echo "  glm-opus   - GLM-4.7-Flash-Claude-Opus-4.5 (port 8004, 200K context, tool calling)"
+    echo "  glm                 - GLM-4.7-Flash (port 8003, 200K context, tool calling)"
+    echo "  qwen                - Qwen3.5-397B (port 8001, 256K context, tool calling)"
+    echo "  glm-opus            - GLM-4.7-Flash-Claude-Opus-4.5 (port 8004, 200K context, tool calling)"
+    echo "  qwen3.5-27b-opus    - Qwen3.5-27B-Claude-4.6-Opus-Distill (port 8005, 262K context, tool calling)"
     echo ""
     echo "IMPORTANT: Only ONE model can run at a time on RTX 3090!"
     echo "   Starting a model automatically stops all others."
@@ -285,6 +288,56 @@ GLMOPUSEOF
     echo -e "${GREEN}GLM-Opus service file created: ${service_file}${NC}"
 }
 
+create_qwen3.5_27b_opus_service() {
+    local service_file="${SERVICE_DIR}/llm-qwen3.5-27b-opus.service"
+    
+    echo -e "${BLUE}Creating Qwen3.5-27B-Opus service file...${NC}"
+    
+    if [[ -f "$service_file" ]]; then
+        echo -e "${YELLOW}Backing up existing Qwen3.5-27B-Opus service...${NC}"
+        mv "$service_file" "${service_file}.bak.$(date +%Y%m%d-%H%M%S)"
+    fi
+    
+    cat > "$service_file" << 'QWEN35OPUSEOF'
+[Unit]
+Description=LLM Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled Server (262K Context with Tool Calling)
+After=network.target nvidia-persistenced.service
+
+[Service]
+Environment="LD_LIBRARY_PATH=/run/opengl-driver/lib:/home/nervkil/apps/llama.cpp/build/bin"
+Environment="HOME=/home/nervkil"
+WorkingDirectory=/home/nervkil/apps
+ExecStart=/home/nervkil/apps/llama.cpp/build/bin/llama-server \
+    --model "/mnt/llm/qwen3.5-27b-opus/model/Qwen3.5-27B.Q4_K_M.gguf" \
+    --alias "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled" \
+    --port 8005 \
+    --host 0.0.0.0 \
+    --ctx-size 262144 \
+    -ngl 999 \
+    --flash-attn on \
+    --threads 16 \
+    -b 2048 \
+    -ub 2048 \
+    --parallel 1 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
+    --jinja \
+    --temp 0.6 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --min-p 0.00
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/nervkil/.local/log/llm-qwen3.5-27b-opus.log
+StandardError=append:/home/nervkil/.local/log/llm-qwen3.5-27b-opus.log
+
+[Install]
+WantedBy=default.target
+QWEN35OPUSEOF
+    
+    echo -e "${GREEN}Qwen3.5-27B-Opus service file created: ${service_file}${NC}"
+}
+
 setup_services() {
     check_systemd
     check_root
@@ -298,6 +351,7 @@ setup_services() {
     create_glm_service
     create_qwen_service
     create_glm_opus_service
+    create_qwen3.5_27b_opus_service
     
     echo ""
     echo -e "${BLUE}Reloading systemd daemon...${NC}"
@@ -305,16 +359,18 @@ setup_services() {
     
     echo ""
     echo -e "${GREEN}=== Setup Complete ===${NC}"
-    echo "Services updated for: glm, qwen, glm-opus"
+    echo "Services updated for: glm, qwen, glm-opus, qwen3.5-27b-opus"
     echo ""
     echo "To start a model (only one at a time!):"
-    echo "  llmctl start glm        # Start GLM-4.7-Flash"
-    echo "  llmctl start qwen       # Start Qwen3.5-397B"
-    echo "  llmctl start glm-opus   # Start GLM-4.7-Flash-Claude-Opus-4.5"
+    echo "  llmctl start glm                # Start GLM-4.7-Flash"
+    echo "  llmctl start qwen               # Start Qwen3.5-397B"
+    echo "  llmctl start glm-opus           # Start GLM-4.7-Flash-Claude-Opus-4.5"
+    echo "  llmctl start qwen3.5-27b-opus   # Start Qwen3.5-27B-Claude-4.6-Opus-Distill"
     echo ""
     echo "To switch between models:"
-    echo "  llmctl switch qwen      # Automatically stops current, starts Qwen"
-    echo "  llmctl switch glm-opus  # Automatically stops current, starts GLM-Opus"
+    echo "  llmctl switch qwen              # Automatically stops current, starts Qwen"
+    echo "  llmctl switch glm-opus          # Automatically stops current, starts GLM-Opus"
+    echo "  llmctl switch qwen3.5-27b-opus  # Automatically stops current, starts Qwen3.5-27B-Opus"
 }
 
 start_model() {
@@ -470,10 +526,15 @@ show_list() {
     echo "             Context: 262,144 tokens (256K)"
     echo "             Features: Tool calling, MoE, CPU offloading for experts"
     echo ""
-    echo -e "  ${GREEN}glm-opus${NC} - GLM-4.7-Flash-Claude-Opus-4.5 (Claude-4.5 Opus Distill)"
+    echo -e "  ${GREEN}glm-opus${NC}        - GLM-4.7-Flash-Claude-Opus-4.5 (Claude-4.5 Opus Distill)"
     echo "             Port: 8004"
     echo "             Context: 200,704 tokens (200K)"
     echo "             Features: Tool calling, Full GPU offload, Claude-4.5 Opus reasoning"
+    echo ""
+    echo -e "  ${GREEN}qwen3.5-27b-opus${NC} - Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled"
+    echo "             Port: 8005"
+    echo "             Context: 262,144 tokens (262K)"
+    echo "             Features: Tool calling, Claude-4.6 Opus reasoning, Developer role support"
     echo ""
     echo -e "${YELLOW}NOTE: RTX 3090 has 24GB VRAM - only ONE model fits at a time${NC}"
     echo -e "${YELLOW}   Use 'llmctl switch <model>' to change models${NC}"
